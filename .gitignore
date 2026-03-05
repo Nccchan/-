@@ -1,0 +1,9 @@
+# 生成済みPDF（個人情報含む）
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
