@@ -7,7 +7,11 @@
       "Bash(# ヒラギノの実体ファイルを探す（.otf形式） find /System/Library/Assets /Library -name \"\"*Hiragino*\"\")",
       "Bash(git --version:*)",
       "Bash(git init:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git remote add:*)",
+      "Bash(git push:*)",
+      "Bash(ssh-keygen:*)"
     ]
   }
 }
