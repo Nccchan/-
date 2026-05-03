@@ -48,7 +48,12 @@ def next_receipt_number():
 # ─────────────────────────────────────────────
 # フォント設定（Arial Unicode：日本語・英字統一）
 # ─────────────────────────────────────────────
-_FONT_PATH = "/Library/Fonts/Arial Unicode.ttf"
+_FONT_CANDIDATES = [
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+]
+_FONT_PATH = next((p for p in _FONT_CANDIDATES if os.path.exists(p)), _FONT_CANDIDATES[0])
 pdfmetrics.registerFont(TTFont("JaFont", _FONT_PATH))
 
 FONT   = "JaFont"
