@@ -73,6 +73,66 @@ def fmt_yen(amount):
     return f"¥{amount:,.0f}"
 
 # ─────────────────────────────────────────────
+# クーポン上乗せ額の取得（T-365 / 2026-09-05）
+# apps/pricing/src/lib/kaitori/coupon-server.ts の couponValueForOrder と同じロジックを
+# Supabase REST 経由で再現する（reserved/used のみ上乗せ対象・fail-soft で 0）。
+# ─────────────────────────────────────────────
+def _supabase_conf():
+    """apps/pricing/.env.local から Supabase URL / service role key を読む（exec_sql.py と同じ方式）。"""
+    env_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "apps", "pricing", ".env.local"
+    )
+    env = {}
+    with open(env_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    return env["NEXT_PUBLIC_SUPABASE_URL"], env["SUPABASE_SERVICE_ROLE_KEY"]
+
+
+def fetch_coupon_bonus(order_id: str) -> int:
+    """order_id（kaitori_orders.id）から、上乗せ対象クーポンの円額を取得する。
+    テーブル未整備・通信失敗・クーポン無しはすべて 0（fail-soft。既存フローを壊さない）。"""
+    if not order_id:
+        return 0
+    import urllib.request
+    import urllib.parse
+
+    try:
+        url, key = _supabase_conf()
+        headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+
+        def _get(path, params):
+            qs = urllib.parse.urlencode(params)
+            req = urllib.request.Request(f"{url}/rest/v1/{path}?{qs}", headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+
+        orders = _get(
+            "kaitori_orders",
+            {"id": f"eq.{order_id}", "select": "coupon_id", "limit": "1"},
+        )
+        coupon_id = (orders[0] or {}).get("coupon_id") if orders else None
+        if not coupon_id:
+            return 0
+
+        coupons = _get(
+            "kaitori_coupons",
+            {"id": f"eq.{coupon_id}", "select": "value_jpy,status", "limit": "1"},
+        )
+        if not coupons:
+            return 0
+        coupon = coupons[0]
+        if coupon.get("status") not in ("reserved", "used"):
+            return 0
+        return int(coupon.get("value_jpy") or 0)
+    except Exception:
+        return 0  # fail-soft: DB未整備・通信失敗でも明細書生成は止めない
+
+
+# ─────────────────────────────────────────────
 # メイン生成関数
 # ─────────────────────────────────────────────
 def generate_receipt(
@@ -88,16 +148,25 @@ def generate_receipt(
     receipt_number: str = None,
     honorific: str = "御中",    # 敬称：法人="御中"、個人="様"
     tax_inclusive: bool = True, # True=単価が税込み（逆算）、False=単価が税抜き（加算）
+    coupon_bonus: int = 0,      # クーポン上乗せ額（円）。呼び出し側が既に把握していれば直接渡す
+    order_id: str = None,       # 指定時のみ Supabase から coupon_bonus を自動取得（coupon_bonus未指定時のみ）
 ):
     if output_dir is None:
         output_dir = os.path.dirname(__file__)
     os.makedirs(output_dir, exist_ok=True)
 
+    if not coupon_bonus and order_id:
+        coupon_bonus = fetch_coupon_bonus(order_id)
+
     if receipt_number is None:
         receipt_number = next_receipt_number()
 
     # ファイル名
+    # ファイル名は「氏名＋敬称_PN-XXX.pdf」（個人=様 / 法人=御中）。
+    # なつき指示のルール。敬称なしで保存すると、お客様へそのまま渡したときに失礼になる。
     safe_name = recipient_name.replace(" ", "").replace("　", "")
+    if honorific and not safe_name.endswith(honorific):
+        safe_name += honorific
     filename = f"{safe_name}_{receipt_number}.pdf"
     filepath = os.path.join(output_dir, filename)
 
@@ -178,13 +247,29 @@ def generate_receipt(
         [p("消費税（10%）", size=9, align="RIGHT"), p(fmt_yen(tax), size=9, align="RIGHT")],
         [p("お支払金額", size=10, bold=True, align="RIGHT"), p(fmt_yen(total), size=10, bold=True, align="RIGHT")],
     ]
+    total_row_idx = 2  # 「お支払金額」行（罫線の基準に使う）
+
+    # クーポン特典（T-365）：口コミクーポン等で振込額に上乗せがある注文のみ、合計行の直後に2行追加。
+    # 明細・小計・消費税・契約合計（お支払金額）はクーポンの有無で一切変えない。
+    if coupon_bonus:
+        summary_data.append([
+            p("クーポン特典", size=9, align="RIGHT"),
+            p(f"+{fmt_yen(coupon_bonus)}", size=9, align="RIGHT"),
+        ])
+        summary_data.append([
+            p("お振込予定額", size=10, bold=True, align="RIGHT"),
+            p(fmt_yen(total + coupon_bonus), size=10, bold=True, align="RIGHT"),
+        ])
+
+    final_row_idx = len(summary_data) - 1  # 二重線を引く最終行（クーポン無し=お支払金額、有り=お振込予定額）
+
     col_w = W * 0.25
     summary_tbl = Table(summary_data, colWidths=[col_w, col_w])
     summary_tbl.setStyle(TableStyle([
         ("ALIGN",      (0, 0), (-1, -1), "RIGHT"),
         ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
-        ("LINEABOVE",  (0, 2), (-1, 2), 1, colors.black),
-        ("LINEBELOW",  (0, 2), (-1, 2), 2, colors.black),
+        ("LINEABOVE",  (0, total_row_idx), (-1, total_row_idx), 1, colors.black),
+        ("LINEBELOW",  (0, final_row_idx), (-1, final_row_idx), 2, colors.black),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ("TOPPADDING",    (0, 0), (-1, -1), 4),
     ]))
